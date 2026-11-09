@@ -1,0 +1,11 @@
+# JDWP Target List
+# Format: IP:PORT[|HOSTNAME[|JAVA_VERSION]]
+#
+# Lines starting with # are comments.
+# Empty lines are ignored.
+#
+# Examples:
+192.168.1.10:5005
+192.168.1.20:8000|webserver01
+10.0.0.50:58999|app-server.internal|11.0
+10.0.0.51:5005|debug-host.internal|17.0.14

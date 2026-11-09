@@ -27,7 +27,7 @@ Requirements:
   - Python 3.8+ (zero pip dependencies)
   - netcat (nc) for catching reverse shells during RCE checks
 
-RCE engine based on jdwp-shellifier by @_hugsy_ (IOActive)
+RCE engine based on jdwp-shellifier by @_hugsy_ (IOActive) ... Love Goes Out <3
 https://github.com/IOActive/jdwp-shellifier
 
 Author: ChiZu (https://github.com/G0ldSec)

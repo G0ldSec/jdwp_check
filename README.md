@@ -1,4 +1,4 @@
-# jdwp-check JDWP Remote Code Execution Checker
+# jdwp-check - JDWP Remote Code Execution Checker
 
 Checks exposed Java Debug Wire Protocol (JDWP) endpoints for unauthenticated access and remote code execution.
 

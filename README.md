@@ -2,7 +2,7 @@
 
 Checks exposed Java Debug Wire Protocol (JDWP) endpoints for unauthenticated access and remote code execution.
 
-JDWP is unauthenticated by design. Any externally reachable JDWP port allows arbitrary code execution as the Java process user. A confirmed handshake alone is a **critical finding**.
+JDWP is unauthenticated by design. Any externally reachable JDWP port allows arbitrary code execution as the Java process user.
 
 ## What it does
 

